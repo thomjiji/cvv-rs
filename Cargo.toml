@@ -3,5 +3,12 @@ name = "cvv-rs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "cvv"
+path = "src/main.rs"
+
 [dependencies]
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+filetime = "0.2"

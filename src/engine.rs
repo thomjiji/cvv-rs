@@ -1,0 +1,327 @@
+use filetime::{set_file_times, FileTime};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use xxhash_rust::xxh3::Xxh3;
+
+const BUFFER_SIZE: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct FileEntry {
+    pub relative_path: PathBuf,
+    pub absolute_path: PathBuf,
+    pub size: u64,
+}
+
+impl FileEntry {
+    pub fn discover(source: &Path) -> Result<Vec<FileEntry>, io::Error> {
+        if source.is_file() {
+            let meta = fs::metadata(source)?;
+            let name = source
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no file name"))?;
+            return Ok(vec![FileEntry {
+                relative_path: PathBuf::from(name),
+                absolute_path: source.to_path_buf(),
+                size: meta.len(),
+            }]);
+        }
+
+        let mut entries = Vec::new();
+        collect_files(source, source, &mut entries)?;
+        entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        Ok(entries)
+    }
+}
+
+fn collect_files(root: &Path, dir: &Path, entries: &mut Vec<FileEntry>) -> Result<(), io::Error> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(root, &path, entries)?;
+        } else if path.is_file() {
+            let meta = fs::metadata(&path)?;
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            entries.push(FileEntry {
+                relative_path: relative.to_path_buf(),
+                absolute_path: path,
+                size: meta.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct CopyResult {
+    pub relative_path: PathBuf,
+    pub source_path: PathBuf,
+    pub size: u64,
+    pub inflight_hash: String,
+    pub success: bool,
+    pub skipped: bool,
+    #[allow(dead_code)]
+    pub error: Option<String>,
+}
+
+fn should_skip(dest_path: &Path, source_size: u64) -> bool {
+    if let Ok(meta) = fs::metadata(dest_path) {
+        meta.len() == source_size
+    } else {
+        false
+    }
+}
+
+fn cleanup_tmp(dest_path: &Path) {
+    let tmp_path = tmp_path_for(dest_path);
+    if tmp_path.exists() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+fn tmp_path_for(dest_path: &Path) -> PathBuf {
+    let mut name = dest_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    dest_path.with_file_name(name)
+}
+
+fn format_size(n: u64) -> String {
+    if n >= 1_073_741_824 {
+        format!("{:.1} GB", n as f64 / 1_073_741_824.0)
+    } else if n >= 1_048_576 {
+        format!("{:.1} MB", n as f64 / 1_048_576.0)
+    } else if n >= 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn copy_single_file(
+    source: &Path,
+    dest_paths: &[PathBuf],
+    _file_size: u64,
+    aborted: &Arc<AtomicBool>,
+    mut on_progress: impl FnMut(u64),
+) -> Result<(u64, String), io::Error> {
+    let mut src = File::open(source)?;
+    let src_meta = src.metadata()?;
+    let mtime = FileTime::from_last_modification_time(&src_meta);
+    let atime = FileTime::from_last_access_time(&src_meta);
+
+    let mut tmp_files: Vec<(PathBuf, PathBuf, File)> = Vec::new();
+    for dest in dest_paths {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = tmp_path_for(dest);
+        let f = File::create(&tmp)?;
+        tmp_files.push((dest.clone(), tmp, f));
+    }
+
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut hasher = Xxh3::new();
+    let mut total_bytes: u64 = 0;
+
+    loop {
+        if aborted.load(Ordering::Relaxed) {
+            for (_, tmp, _) in &tmp_files {
+                let _ = fs::remove_file(tmp);
+            }
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "aborted"));
+        }
+
+        let n = src.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..n]);
+        for (_, _, f) in &mut tmp_files {
+            f.write_all(&buffer[..n])?;
+        }
+        total_bytes += n as u64;
+        on_progress(total_bytes);
+    }
+
+    for (dest, tmp, f) in tmp_files {
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, &dest)?;
+        set_file_times(&dest, atime, mtime)?;
+    }
+
+    let hash = format!("{:016X}", hasher.digest());
+    Ok((total_bytes, hash))
+}
+
+pub fn copy_all(
+    _source_root: &Path,
+    files: &[FileEntry],
+    destinations: &[PathBuf],
+    aborted: &Arc<AtomicBool>,
+) -> Vec<CopyResult> {
+    let total_files = files.len();
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+    let mut bytes_done: u64 = 0;
+    let mut results = Vec::with_capacity(total_files);
+    let start = Instant::now();
+
+    for (i, file) in files.iter().enumerate() {
+        if aborted.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let dest_paths: Vec<PathBuf> = destinations.iter().map(|d| d.join(&file.relative_path)).collect();
+
+        let dests_to_copy: Vec<PathBuf> = dest_paths
+            .iter()
+            .filter(|d| {
+                cleanup_tmp(d);
+                !should_skip(d, file.size)
+            })
+            .cloned()
+            .collect();
+
+        if dests_to_copy.is_empty() {
+            println!(
+                "[{}/{}] Skipped {} (already exists)",
+                i + 1,
+                total_files,
+                file.relative_path.display()
+            );
+            bytes_done += file.size;
+            results.push(CopyResult {
+                relative_path: file.relative_path.clone(),
+                source_path: file.absolute_path.clone(),
+                size: file.size,
+                inflight_hash: String::new(),
+                success: true,
+                skipped: true,
+                error: None,
+            });
+            continue;
+        }
+
+        let file_start = Instant::now();
+        let file_size = file.size;
+        let short_name = file
+            .relative_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let idx = i + 1;
+        let mut last_print = Instant::now();
+
+        let progress = |file_bytes: u64| {
+            let now = Instant::now();
+            if now.duration_since(last_print).as_millis() < 100 {
+                return;
+            }
+            last_print = now;
+
+            let elapsed = file_start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                file_bytes as f64 / 1_048_576.0 / elapsed
+            } else {
+                0.0
+            };
+            let file_pct = if file_size > 0 {
+                file_bytes as f64 / file_size as f64 * 100.0
+            } else {
+                100.0
+            };
+            let overall_pct = if total_bytes > 0 {
+                (bytes_done + file_bytes) as f64 / total_bytes as f64 * 100.0
+            } else {
+                100.0
+            };
+            print!(
+                "\r[{}/{}] Copying {}  {:.1}%  {:.1} MB/s  Overall: {:.1}%    ",
+                idx, total_files, short_name, file_pct, speed, overall_pct,
+            );
+            let _ = io::stdout().flush();
+        };
+
+        match copy_single_file(&file.absolute_path, &dests_to_copy, file_size, aborted, progress) {
+            Ok((bytes, hash)) => {
+                bytes_done += bytes;
+                let elapsed = file_start.elapsed().as_secs_f64();
+                let speed = if elapsed > 0.0 {
+                    bytes as f64 / 1_048_576.0 / elapsed
+                } else {
+                    0.0
+                };
+                let overall_pct = if total_bytes > 0 {
+                    bytes_done as f64 / total_bytes as f64 * 100.0
+                } else {
+                    100.0
+                };
+                print!(
+                    "\r[{}/{}] Copied {}  {}  {}  {:.1} MB/s  Overall: {:.1}%    \n",
+                    idx,
+                    total_files,
+                    file.relative_path.display(),
+                    hash,
+                    format_size(bytes),
+                    speed,
+                    overall_pct,
+                );
+                let _ = io::stdout().flush();
+                results.push(CopyResult {
+                    relative_path: file.relative_path.clone(),
+                    source_path: file.absolute_path.clone(),
+                    size: bytes,
+                    inflight_hash: hash,
+                    success: true,
+                    skipped: false,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                if e.kind() == io::ErrorKind::Interrupted {
+                    break;
+                }
+                print!("\r");
+                eprintln!(
+                    "[{}/{}] FAILED {}  {}",
+                    idx,
+                    total_files,
+                    file.relative_path.display(),
+                    e
+                );
+                results.push(CopyResult {
+                    relative_path: file.relative_path.clone(),
+                    source_path: file.absolute_path.clone(),
+                    size: file.size,
+                    inflight_hash: String::new(),
+                    success: false,
+                    skipped: false,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let copied = results.iter().filter(|r| r.success && !r.skipped).count();
+    let skipped = results.iter().filter(|r| r.skipped).count();
+    let avg_speed = if elapsed > 0.0 {
+        bytes_done as f64 / 1_048_576.0 / elapsed
+    } else {
+        0.0
+    };
+    println!(
+        "\nCopy complete: {} copied, {} skipped, {:.1} MB/s avg",
+        copied, skipped, avg_speed
+    );
+
+    results
+}
