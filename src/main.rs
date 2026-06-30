@@ -3,26 +3,29 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process;
+use xxhash_rust::xxh3::Xxh3;
 
 const BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8 MB
 
-fn copy_file(source: &Path, destination: &Path) -> Result<u64, std::io::Error> {
+fn copy_file(source: &Path, destination: &Path) -> Result<(u64, String), std::io::Error> {
     let mut src = File::open(source)?;
     let mut dst = File::create(destination)?;
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut total_bytes: u64 = 0;
+    let mut hasher = Xxh3::new();
 
     loop {
         let bytes_read = src.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
+        hasher.update(&buffer[..bytes_read]);
         dst.write_all(&buffer[..bytes_read])?;
         total_bytes += bytes_read as u64;
     }
 
-    println!("about to return");
-    Ok(total_bytes)
+    let hash = format!("{:016x}", hasher.digest());
+    Ok((total_bytes, hash))
 }
 
 fn main() {
@@ -47,11 +50,12 @@ fn main() {
     };
 
     match copy_file(source, &destination) {
-        Ok(bytes) => println!(
-            "Copied {} -> {}  ({} bytes)",
+        Ok((bytes, hash)) => println!(
+            "Copied {} -> {}  ({} bytes)  xxh3: {}",
             source.display(),
             destination.display(),
-            bytes
+            bytes,
+            hash
         ),
         Err(e) => {
             eprintln!("Error: {}", e);
