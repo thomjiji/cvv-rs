@@ -3,11 +3,13 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 use xxhash_rust::xxh3::Xxh3;
 
 const BUFFER_SIZE: usize = 8 * 1024 * 1024;
+// Chunks in flight per destination; bounds memory and provides backpressure.
+const QUEUE_DEPTH: usize = 4;
 
 #[derive(Debug)]
 pub struct FileEntry {
@@ -106,7 +108,6 @@ fn format_size(n: u64) -> String {
 fn copy_single_file(
     source: &Path,
     dest_paths: &[PathBuf],
-    _file_size: u64,
     aborted: &Arc<AtomicBool>,
     mut on_progress: impl FnMut(u64),
 ) -> Result<(u64, String), io::Error> {
@@ -115,50 +116,91 @@ fn copy_single_file(
     let mtime = FileTime::from_last_modification_time(&src_meta);
     let atime = FileTime::from_last_access_time(&src_meta);
 
-    let mut tmp_files: Vec<(PathBuf, PathBuf, File)> = Vec::new();
+    let mut targets: Vec<(PathBuf, PathBuf, Option<File>)> = Vec::new();
     for dest in dest_paths {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
         let tmp = tmp_path_for(dest);
         let f = File::create(&tmp)?;
-        tmp_files.push((dest.clone(), tmp, f));
+        targets.push((dest.clone(), tmp, Some(f)));
     }
 
-    let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut hasher = Xxh3::new();
-    let mut total_bytes: u64 = 0;
+    // Reader thread streams chunks to one writer thread per destination through
+    // bounded channels, so the source read never stalls on a destination write.
+    let copy_result = std::thread::scope(|s| {
+        let mut senders = Vec::with_capacity(targets.len());
+        let mut handles = Vec::with_capacity(targets.len());
+        for (_, _, f) in &mut targets {
+            let mut f = f.take().unwrap();
+            let (tx, rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(QUEUE_DEPTH);
+            senders.push(tx);
+            handles.push(s.spawn(move || -> io::Result<()> {
+                for chunk in rx {
+                    f.write_all(&chunk)?;
+                }
+                f.sync_all()
+            }));
+        }
 
-    loop {
-        if aborted.load(Ordering::Relaxed) {
-            for (_, tmp, _) in &tmp_files {
+        let mut hasher = Xxh3::new();
+        let mut total_bytes: u64 = 0;
+        let mut read_result: io::Result<()> = Ok(());
+
+        loop {
+            if aborted.load(Ordering::Relaxed) {
+                read_result = Err(io::Error::new(io::ErrorKind::Interrupted, "aborted"));
+                break;
+            }
+            let mut buf = vec![0u8; BUFFER_SIZE];
+            match src.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.truncate(n);
+                    hasher.update(&buf);
+                    let chunk = Arc::new(buf);
+                    // A failed send means that writer died; its error surfaces on join.
+                    if senders.iter().any(|tx| tx.send(chunk.clone()).is_err()) {
+                        break;
+                    }
+                    total_bytes += n as u64;
+                    on_progress(total_bytes);
+                }
+                Err(e) => {
+                    read_result = Err(e);
+                    break;
+                }
+            }
+        }
+
+        drop(senders);
+        let mut write_result: io::Result<()> = Ok(());
+        for h in handles {
+            let r = h.join().unwrap();
+            if write_result.is_ok() {
+                write_result = r;
+            }
+        }
+        read_result
+            .and(write_result)
+            .map(|_| (total_bytes, format!("{:016X}", hasher.digest())))
+    });
+
+    match copy_result {
+        Ok((total_bytes, hash)) => {
+            for (dest, tmp, _) in &targets {
+                fs::rename(tmp, dest)?;
+                set_file_times(dest, atime, mtime)?;
+            }
+            Ok((total_bytes, hash))
+        }
+        Err(e) => {
+            for (_, tmp, _) in &targets {
                 let _ = fs::remove_file(tmp);
             }
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "aborted"));
+            Err(e)
         }
-
-        let n = src.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-
-        hasher.update(&buffer[..n]);
-        for (_, _, f) in &mut tmp_files {
-            f.write_all(&buffer[..n])?;
-        }
-        total_bytes += n as u64;
-        on_progress(total_bytes);
     }
-
-    for (dest, tmp, f) in tmp_files {
-        f.sync_all()?;
-        drop(f);
-        fs::rename(&tmp, &dest)?;
-        set_file_times(&dest, atime, mtime)?;
-    }
-
-    let hash = format!("{:016X}", hasher.digest());
-    Ok((total_bytes, hash))
 }
 
 pub fn copy_all(
@@ -250,7 +292,7 @@ pub fn copy_all(
             let _ = io::stdout().flush();
         };
 
-        match copy_single_file(&file.absolute_path, &dests_to_copy, file_size, aborted, progress) {
+        match copy_single_file(&file.absolute_path, &dests_to_copy, aborted, progress) {
             Ok((bytes, hash)) => {
                 bytes_done += bytes;
                 let elapsed = file_start.elapsed().as_secs_f64();
