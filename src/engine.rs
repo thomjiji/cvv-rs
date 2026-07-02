@@ -311,20 +311,14 @@ pub fn copy_all(
                 } else {
                     0.0
                 };
-                let overall_pct = if total_bytes > 0 {
-                    bytes_done as f64 / total_bytes as f64 * 100.0
-                } else {
-                    100.0
-                };
                 progress.println(format!(
-                    "[{}/{}] Copied {}  {}  {}  {:.1} MB/s  Overall: {:.1}%",
+                    "[{}/{}] Copied {}  {}  {}  {:.1} MB/s",
                     idx,
                     total_files,
                     file.relative_path.display(),
                     hash,
                     format_size(bytes),
                     speed,
-                    overall_pct,
                 ));
                 results.push(CopyResult {
                     relative_path: file.relative_path.clone(),

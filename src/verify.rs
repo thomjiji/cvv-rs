@@ -327,14 +327,9 @@ pub fn verify_all(
         } else {
             0.0
         };
-        let overall_pct = if overall_total_bytes > 0 {
-            bytes_done as f64 / overall_total_bytes as f64 * 100.0
-        } else {
-            100.0
-        };
         progress.println(format!(
-            "[{}/{}] Verified {}  {}  {:.1} MB/s  Overall: {:.1}%",
-            idx, total, file_name, results[ri].inflight_hash, speed, overall_pct,
+            "[{}/{}] Verified {}  {}  {:.1} MB/s",
+            idx, total, file_name, results[ri].inflight_hash, speed,
         ));
     }
 
