@@ -1,6 +1,7 @@
 use crate::engine::CopyResult;
+use crate::progress::Progress;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -104,17 +105,12 @@ fn hash_file_thread(
 fn hash_paths_parallel(
     paths: &[PathBuf],
     aborted: &Arc<AtomicBool>,
-    idx: usize,
-    total_files: usize,
-    file_name: &str,
-    phase: &str,
+    progress: &Progress,
     hash_total_bytes: u64,
     bytes_done: u64,
-    overall_total_bytes: u64,
 ) -> Vec<Result<String, io::Error>> {
     let shared_bytes = AtomicU64::new(0);
     let done = AtomicBool::new(false);
-    let file_start = Instant::now();
 
     std::thread::scope(|s| {
         let handles: Vec<_> = paths
@@ -128,30 +124,8 @@ fn hash_paths_parallel(
                 if done.load(Ordering::Relaxed) {
                     break;
                 }
-                let hashed = shared_bytes.load(Ordering::Relaxed);
-                let elapsed = file_start.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    hashed as f64 / 1_048_576.0 / elapsed
-                } else {
-                    0.0
-                };
-                let file_pct = if hash_total_bytes > 0 {
-                    hashed as f64 / hash_total_bytes as f64 * 100.0
-                } else {
-                    100.0
-                };
-                let overall_pct = if overall_total_bytes > 0 {
-                    (bytes_done + hashed.min(hash_total_bytes)) as f64
-                        / overall_total_bytes as f64
-                        * 100.0
-                } else {
-                    100.0
-                };
-                print!(
-                    "\r[{}/{}] {} {}  {:.1}%  {:.1} MB/s  Overall: {:.1}%    ",
-                    idx, total_files, phase, file_name, file_pct, speed, overall_pct,
-                );
-                let _ = io::stdout().flush();
+                let hashed = shared_bytes.load(Ordering::Relaxed).min(hash_total_bytes);
+                progress.update(hashed, bytes_done + hashed);
             }
         });
 
@@ -219,6 +193,7 @@ pub fn verify_all(
     let mut all_ok = true;
     let mut ok_count = 0;
     let start = Instant::now();
+    let progress = Progress::new(overall_total_bytes);
 
     for (i, &ri) in indices.iter().enumerate() {
         if aborted.load(Ordering::Relaxed) {
@@ -244,17 +219,12 @@ pub fn verify_all(
         }
         paths.extend(destinations.iter().map(|d| d.join(&result.relative_path)));
 
-        let mut hashes = hash_paths_parallel(
-            &paths,
-            aborted,
-            idx,
-            total,
-            &short_name,
-            "Verifying",
+        progress.file_start(
+            &format!("{idx}/{total}"),
+            &format!("Verifying {short_name}"),
             hash_total,
-            bytes_done,
-            overall_total_bytes,
         );
+        let mut hashes = hash_paths_parallel(&paths, aborted, &progress, hash_total, bytes_done);
         bytes_done += hash_total;
 
         if hashes
@@ -273,18 +243,20 @@ pub fn verify_all(
             match hashes.remove(0) {
                 Ok(h) => {
                     if !expected.is_empty() && h != expected {
-                        print!("\r");
-                        eprintln!(
-                            "[{}/{}] FAIL {} (source changed: {} vs inflight {})",
-                            idx, total, file_name, h, expected
-                        );
+                        progress.suspend(|| {
+                            eprintln!(
+                                "[{}/{}] FAIL {} (source changed: {} vs inflight {})",
+                                idx, total, file_name, h, expected
+                            );
+                        });
                         file_ok = false;
                     }
                     Some(h)
                 }
                 Err(e) => {
-                    print!("\r");
-                    eprintln!("[{}/{}] FAIL {} (source read error: {})", idx, total, file_name, e);
+                    progress.suspend(|| {
+                        eprintln!("[{}/{}] FAIL {} (source read error: {})", idx, total, file_name, e);
+                    });
                     file_ok = false;
                     None
                 }
@@ -301,35 +273,37 @@ pub fn verify_all(
         for (j, hash_result) in hashes.iter().enumerate() {
             match (hash_result, &reference) {
                 (Ok(hash), Some(r)) if hash != r => {
-                    print!("\r");
-                    if let Some(rj) = ref_from_target {
-                        eprintln!(
-                            "[{}/{}] FAIL {} (targets disagree: {} = {} vs {} = {})",
-                            idx,
-                            total,
-                            file_name,
-                            destinations[j].display(),
-                            hash,
-                            destinations[rj].display(),
-                            r
-                        );
-                    } else {
-                        eprintln!(
-                            "[{}/{}] FAIL {} -> {} (hash mismatch: {} vs {})",
-                            idx,
-                            total,
-                            file_name,
-                            destinations[j].display(),
-                            hash,
-                            r
-                        );
-                    }
+                    progress.suspend(|| {
+                        if let Some(rj) = ref_from_target {
+                            eprintln!(
+                                "[{}/{}] FAIL {} (targets disagree: {} = {} vs {} = {})",
+                                idx,
+                                total,
+                                file_name,
+                                destinations[j].display(),
+                                hash,
+                                destinations[rj].display(),
+                                r
+                            );
+                        } else {
+                            eprintln!(
+                                "[{}/{}] FAIL {} -> {} (hash mismatch: {} vs {})",
+                                idx,
+                                total,
+                                file_name,
+                                destinations[j].display(),
+                                hash,
+                                r
+                            );
+                        }
+                    });
                     file_ok = false;
                 }
                 (Ok(_), _) => {}
                 (Err(e), _) => {
-                    print!("\r");
-                    eprintln!("[{}/{}] FAIL {} (dest read error: {})", idx, total, file_name, e);
+                    progress.suspend(|| {
+                        eprintln!("[{}/{}] FAIL {} (dest read error: {})", idx, total, file_name, e);
+                    });
                     file_ok = false;
                 }
             }
@@ -346,6 +320,7 @@ pub fn verify_all(
         }
         ok_count += 1;
 
+        progress.update(hash_total, bytes_done);
         let elapsed = file_start.elapsed().as_secs_f64();
         let speed = if elapsed > 0.0 {
             hash_total as f64 / 1_048_576.0 / elapsed
@@ -357,12 +332,13 @@ pub fn verify_all(
         } else {
             100.0
         };
-        print!(
-            "\r[{}/{}] Verified {}  {}  {:.1} MB/s  Overall: {:.1}%    \n",
+        progress.println(format!(
+            "[{}/{}] Verified {}  {}  {:.1} MB/s  Overall: {:.1}%",
             idx, total, file_name, results[ri].inflight_hash, speed, overall_pct,
-        );
-        let _ = io::stdout().flush();
+        ));
     }
+
+    progress.finish();
 
     let elapsed = start.elapsed().as_secs_f64();
     let avg_speed = if elapsed > 0.0 {

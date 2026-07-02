@@ -1,3 +1,4 @@
+use crate::progress::Progress;
 use filetime::{set_file_times, FileTime};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -238,6 +239,7 @@ pub fn copy_all(
     let mut copied_bytes: u64 = 0;
     let mut results = Vec::with_capacity(total_files);
     let start = Instant::now();
+    let progress = Progress::new(total_bytes);
 
     for (i, file) in files.iter().enumerate() {
         if aborted.load(Ordering::Relaxed) {
@@ -256,13 +258,14 @@ pub fn copy_all(
             .collect();
 
         if dests_to_copy.is_empty() {
-            println!(
+            progress.println(format!(
                 "[{}/{}] Skipped {} (already exists)",
                 i + 1,
                 total_files,
                 file.relative_path.display()
-            );
+            ));
             bytes_done += file.size;
+            progress.advance_overall(file.size);
             results.push(CopyResult {
                 relative_path: file.relative_path.clone(),
                 source_path: file.absolute_path.clone(),
@@ -284,42 +287,24 @@ pub fn copy_all(
             .to_string_lossy()
             .to_string();
         let idx = i + 1;
-        let mut last_print = Instant::now();
+        let mut last_update = Instant::now();
+        let bytes_done_before = bytes_done;
+        progress.file_start(&format!("{idx}/{total_files}"), &short_name, file_size);
 
-        let progress = |file_bytes: u64| {
+        let file_progress = |file_bytes: u64| {
             let now = Instant::now();
-            if now.duration_since(last_print).as_millis() < 100 {
+            if now.duration_since(last_update).as_millis() < 100 {
                 return;
             }
-            last_print = now;
-
-            let elapsed = file_start.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.0 {
-                file_bytes as f64 / 1_048_576.0 / elapsed
-            } else {
-                0.0
-            };
-            let file_pct = if file_size > 0 {
-                file_bytes as f64 / file_size as f64 * 100.0
-            } else {
-                100.0
-            };
-            let overall_pct = if total_bytes > 0 {
-                (bytes_done + file_bytes) as f64 / total_bytes as f64 * 100.0
-            } else {
-                100.0
-            };
-            print!(
-                "\r[{}/{}] Copying {}  {:.1}%  {:.1} MB/s  Overall: {:.1}%    ",
-                idx, total_files, short_name, file_pct, speed, overall_pct,
-            );
-            let _ = io::stdout().flush();
+            last_update = now;
+            progress.update(file_bytes, bytes_done_before + file_bytes);
         };
 
-        match copy_single_file(&file.absolute_path, &dests_to_copy, aborted, progress) {
+        match copy_single_file(&file.absolute_path, &dests_to_copy, aborted, file_progress) {
             Ok((bytes, hash)) => {
                 bytes_done += bytes;
                 copied_bytes += bytes;
+                progress.update(bytes, bytes_done);
                 let elapsed = file_start.elapsed().as_secs_f64();
                 let speed = if elapsed > 0.0 {
                     bytes as f64 / 1_048_576.0 / elapsed
@@ -331,8 +316,8 @@ pub fn copy_all(
                 } else {
                     100.0
                 };
-                print!(
-                    "\r[{}/{}] Copied {}  {}  {}  {:.1} MB/s  Overall: {:.1}%    \n",
+                progress.println(format!(
+                    "[{}/{}] Copied {}  {}  {}  {:.1} MB/s  Overall: {:.1}%",
                     idx,
                     total_files,
                     file.relative_path.display(),
@@ -340,8 +325,7 @@ pub fn copy_all(
                     format_size(bytes),
                     speed,
                     overall_pct,
-                );
-                let _ = io::stdout().flush();
+                ));
                 results.push(CopyResult {
                     relative_path: file.relative_path.clone(),
                     source_path: file.absolute_path.clone(),
@@ -356,14 +340,15 @@ pub fn copy_all(
                 if e.kind() == io::ErrorKind::Interrupted {
                     break;
                 }
-                print!("\r");
-                eprintln!(
-                    "[{}/{}] FAILED {}  {}",
-                    idx,
-                    total_files,
-                    file.relative_path.display(),
-                    e
-                );
+                progress.suspend(|| {
+                    eprintln!(
+                        "[{}/{}] FAILED {}  {}",
+                        idx,
+                        total_files,
+                        file.relative_path.display(),
+                        e
+                    );
+                });
                 results.push(CopyResult {
                     relative_path: file.relative_path.clone(),
                     source_path: file.absolute_path.clone(),
@@ -376,6 +361,8 @@ pub fn copy_all(
             }
         }
     }
+
+    progress.finish();
 
     let elapsed = start.elapsed().as_secs_f64();
     let copied = results.iter().filter(|r| r.success && !r.skipped).count();

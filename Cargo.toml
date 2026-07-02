@@ -12,6 +12,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 filetime = "0.2"
+indicatif = "0.17"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

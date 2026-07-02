@@ -1,5 +1,6 @@
 mod engine;
 mod hashfile;
+mod progress;
 mod verify;
 
 use clap::Parser;
