@@ -19,33 +19,56 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
-    pub fn discover(source: &Path) -> Result<Vec<FileEntry>, io::Error> {
+    // Returns (files, dirs); dirs holds every directory's relative path so empty dirs
+    // can be recreated at the destination even though they carry no FileEntry.
+    pub fn discover(source: &Path) -> Result<(Vec<FileEntry>, Vec<PathBuf>), io::Error> {
         if source.is_file() {
             let meta = fs::metadata(source)?;
             let name = source
                 .file_name()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no file name"))?;
-            return Ok(vec![FileEntry {
-                relative_path: PathBuf::from(name),
-                absolute_path: source.to_path_buf(),
-                size: meta.len(),
-            }]);
+            return Ok((
+                vec![FileEntry {
+                    relative_path: PathBuf::from(name),
+                    absolute_path: source.to_path_buf(),
+                    size: meta.len(),
+                }],
+                Vec::new(),
+            ));
         }
 
         let mut entries = Vec::new();
-        collect_files(source, source, &mut entries)?;
+        let mut dirs = Vec::new();
+        collect_files(source, source, &mut entries, &mut dirs)?;
         entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-        Ok(entries)
+        dirs.sort();
+        Ok((entries, dirs))
     }
 }
 
-fn collect_files(root: &Path, dir: &Path, entries: &mut Vec<FileEntry>) -> Result<(), io::Error> {
+fn collect_files(
+    root: &Path,
+    dir: &Path,
+    entries: &mut Vec<FileEntry>,
+    dirs: &mut Vec<PathBuf>,
+) -> Result<(), io::Error> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            collect_files(root, &path, entries)?;
-        } else if path.is_file() {
+        // file_type() does not follow symlinks (unlike path.is_dir()/is_file()), so a
+        // symlinked directory can't send us into infinite recursion.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            eprintln!("Warning: skipping symlink: {}", path.display());
+            continue;
+        }
+        if file_type.is_dir() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            dirs.push(relative.to_path_buf());
+            collect_files(root, &path, entries, dirs)?;
+        } else if file_type.is_file() {
             let meta = fs::metadata(&path)?;
             let relative = path
                 .strip_prefix(root)
@@ -212,6 +235,7 @@ pub fn copy_all(
     let total_files = files.len();
     let total_bytes: u64 = files.iter().map(|f| f.size).sum();
     let mut bytes_done: u64 = 0;
+    let mut copied_bytes: u64 = 0;
     let mut results = Vec::with_capacity(total_files);
     let start = Instant::now();
 
@@ -295,6 +319,7 @@ pub fn copy_all(
         match copy_single_file(&file.absolute_path, &dests_to_copy, aborted, progress) {
             Ok((bytes, hash)) => {
                 bytes_done += bytes;
+                copied_bytes += bytes;
                 let elapsed = file_start.elapsed().as_secs_f64();
                 let speed = if elapsed > 0.0 {
                     bytes as f64 / 1_048_576.0 / elapsed
@@ -355,15 +380,19 @@ pub fn copy_all(
     let elapsed = start.elapsed().as_secs_f64();
     let copied = results.iter().filter(|r| r.success && !r.skipped).count();
     let skipped = results.iter().filter(|r| r.skipped).count();
-    let avg_speed = if elapsed > 0.0 {
-        bytes_done as f64 / 1_048_576.0 / elapsed
+    if copied_bytes == 0 {
+        println!("\nCopy complete: {} copied, {} skipped", copied, skipped);
     } else {
-        0.0
-    };
-    println!(
-        "\nCopy complete: {} copied, {} skipped, {:.1} MB/s avg",
-        copied, skipped, avg_speed
-    );
+        let avg_speed = if elapsed > 0.0 {
+            copied_bytes as f64 / 1_048_576.0 / elapsed
+        } else {
+            0.0
+        };
+        println!(
+            "\nCopy complete: {} copied, {} skipped, {:.1} MB/s avg",
+            copied, skipped, avg_speed
+        );
+    }
 
     results
 }

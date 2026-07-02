@@ -5,6 +5,7 @@ mod verify;
 use clap::Parser;
 use engine::{copy_all, FileEntry};
 use hashfile::write_hashfile;
+use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
@@ -90,7 +91,7 @@ fn main() {
         }
     }
 
-    let files = match FileEntry::discover(source) {
+    let (files, dirs) = match FileEntry::discover(source) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error discovering files: {e}");
@@ -98,8 +99,28 @@ fn main() {
         }
     };
 
+    // Recreate every discovered directory at each destination, including empty ones,
+    // which copy_all would otherwise never touch.
+    let mut dir_create_failed = false;
+    for dest in &cli.destinations {
+        for rel_dir in &dirs {
+            let target_dir = dest.join(rel_dir);
+            if let Err(e) = fs::create_dir_all(&target_dir) {
+                eprintln!("Error creating directory {}: {e}", target_dir.display());
+                dir_create_failed = true;
+            }
+        }
+    }
+    if dir_create_failed {
+        process::exit(1);
+    }
+
     if files.is_empty() {
-        println!("No files to copy.");
+        if dirs.is_empty() {
+            println!("No files to copy.");
+        } else {
+            println!("No files to copy ({} empty dir(s) recreated).", dirs.len());
+        }
         return;
     }
 
@@ -164,10 +185,19 @@ fn main() {
         println!("Verification passed.");
     }
 
-    // Generate hash files
+    // Generate hash files; keep trying remaining destinations even if one fails.
+    let mut hashfile_failed = false;
     for dest in &cli.destinations {
-        let hashfile_path = write_hashfile(source, &results, dest);
-        println!("Hash file: {}", hashfile_path.display());
+        match write_hashfile(source, &results, dest) {
+            Ok(hashfile_path) => println!("Hash file: {}", hashfile_path.display()),
+            Err(e) => {
+                eprintln!("Error writing hash file for {}: {e}", dest.display());
+                hashfile_failed = true;
+            }
+        }
+    }
+    if hashfile_failed {
+        process::exit(1);
     }
 
     println!(

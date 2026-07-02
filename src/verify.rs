@@ -358,8 +358,8 @@ pub fn verify_all(
             100.0
         };
         print!(
-            "\r[{}/{}] Verified {}  {:.1} MB/s  Overall: {:.1}%    \n",
-            idx, total, file_name, speed, overall_pct,
+            "\r[{}/{}] Verified {}  {}  {:.1} MB/s  Overall: {:.1}%    \n",
+            idx, total, file_name, results[ri].inflight_hash, speed, overall_pct,
         );
         let _ = io::stdout().flush();
     }
