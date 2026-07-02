@@ -111,7 +111,7 @@ fn main() {
         total_bytes as f64 / 1_073_741_824.0
     );
 
-    let results = copy_all(source, &files, &cli.destinations, &aborted);
+    let mut results = copy_all(source, &files, &cli.destinations, &aborted);
 
     if aborted.load(Ordering::SeqCst) {
         eprintln!("Copy interrupted.");
@@ -137,16 +137,9 @@ fn main() {
         prompt_verify_mode()
     };
 
-    // Skip verification for transfer mode or user declined
-    let verify_mode = match verify_mode {
-        Some(VerifyMode::Transfer) | None => {
-            if verify_mode.is_none() && cli.mode.is_none() {
-                println!("Verification skipped.");
-            }
-            None
-        }
-        Some(m) => Some(m),
-    };
+    if verify_mode.is_none() {
+        println!("Verification skipped.");
+    }
 
     if let Some(mode) = verify_mode {
         println!(
@@ -154,10 +147,10 @@ fn main() {
             match mode {
                 VerifyMode::Source => "source",
                 VerifyMode::Target => "target",
-                VerifyMode::Transfer => unreachable!(),
+                VerifyMode::Transfer => "transfer",
             }
         );
-        let verify_ok = verify_all(source, &results, &cli.destinations, mode, &aborted);
+        let verify_ok = verify_all(&mut results, &cli.destinations, mode, &aborted);
 
         if aborted.load(Ordering::SeqCst) {
             eprintln!("Verification interrupted.");

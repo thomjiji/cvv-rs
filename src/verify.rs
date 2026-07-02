@@ -55,10 +55,26 @@ fn open_no_cache(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn open_no_cache(path: &Path) -> io::Result<File> {
-    // TODO: F_NOCACHE on macOS, O_DIRECT on Linux
-    File::open(path)
+    use std::os::fd::AsRawFd;
+    let f = File::open(path)?;
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(f)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_no_cache(path: &Path) -> io::Result<File> {
+    // O_DIRECT needs 4096-aligned buffers (AlignedBuffer) and chunk-multiple reads.
+    // Falls back to buffered IO on filesystems that reject O_DIRECT (e.g. tmpfs).
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+        .or_else(|_| File::open(path))
 }
 
 fn hash_file_thread(
@@ -145,40 +161,71 @@ fn hash_paths_parallel(
     })
 }
 
+fn verify_transfer(results: &[CopyResult], destinations: &[PathBuf]) -> bool {
+    let mut all_ok = true;
+    let mut checked = 0;
+    for r in results.iter().filter(|r| r.success) {
+        for d in destinations {
+            let path = d.join(&r.relative_path);
+            match std::fs::metadata(&path) {
+                Ok(m) if m.len() == r.size => {}
+                Ok(m) => {
+                    eprintln!(
+                        "FAIL {} ({} bytes, expected {})",
+                        path.display(),
+                        m.len(),
+                        r.size
+                    );
+                    all_ok = false;
+                }
+                Err(e) => {
+                    eprintln!("FAIL {} ({})", path.display(), e);
+                    all_ok = false;
+                }
+            }
+            checked += 1;
+        }
+    }
+    println!("Transfer check: {checked} file(s) size-compared");
+    all_ok
+}
+
+// Verifies every successful result, including collision-skipped files: those have no
+// in-flight hash, so the reference hash comes from the source (source mode) or the
+// first target (target mode) and is written back so the hashfile stays complete.
 pub fn verify_all(
-    _source_root: &Path,
-    results: &[CopyResult],
+    results: &mut [CopyResult],
     destinations: &[PathBuf],
     mode: VerifyMode,
     aborted: &Arc<AtomicBool>,
 ) -> bool {
-    let to_verify: Vec<&CopyResult> = results.iter().filter(|r| r.success && !r.skipped).collect();
-    let total = to_verify.len();
+    if matches!(mode, VerifyMode::Transfer) {
+        return verify_transfer(results, destinations);
+    }
 
+    let indices: Vec<usize> = (0..results.len()).filter(|&i| results[i].success).collect();
+    let total = indices.len();
     if total == 0 {
-        println!("Nothing to verify (all files were skipped).");
+        println!("Nothing to verify.");
         return true;
     }
 
     let num_dests = destinations.len() as u64;
-    let overall_total_bytes: u64 = to_verify
-        .iter()
-        .map(|r| match mode {
-            VerifyMode::Source => r.size * (1 + num_dests),
-            VerifyMode::Target => r.size * num_dests,
-            VerifyMode::Transfer => 0,
-        })
-        .sum();
+    let with_source = matches!(mode, VerifyMode::Source);
+    let per_file_factor = num_dests + with_source as u64;
+    let overall_total_bytes: u64 = indices.iter().map(|&i| results[i].size * per_file_factor).sum();
 
     let mut bytes_done: u64 = 0;
     let mut all_ok = true;
+    let mut ok_count = 0;
     let start = Instant::now();
 
-    for (i, result) in to_verify.iter().enumerate() {
+    for (i, &ri) in indices.iter().enumerate() {
         if aborted.load(Ordering::Relaxed) {
             return false;
         }
 
+        let result = &results[ri];
         let idx = i + 1;
         let file_name = result.relative_path.display().to_string();
         let short_name = result
@@ -187,144 +234,121 @@ pub fn verify_all(
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let expected = &result.inflight_hash;
+        let expected = result.inflight_hash.clone();
+        let hash_total = result.size * per_file_factor;
         let file_start = Instant::now();
 
-        match mode {
-            VerifyMode::Target => {
-                let paths: Vec<PathBuf> = destinations
-                    .iter()
-                    .map(|d| d.join(&result.relative_path))
-                    .collect();
-                let hash_total = result.size * num_dests;
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(per_file_factor as usize);
+        if with_source {
+            paths.push(result.source_path.clone());
+        }
+        paths.extend(destinations.iter().map(|d| d.join(&result.relative_path)));
 
-                let hashes = hash_paths_parallel(
-                    &paths,
-                    aborted,
-                    idx,
-                    total,
-                    &short_name,
-                    "Verifying",
-                    hash_total,
-                    bytes_done,
-                    overall_total_bytes,
-                );
+        let mut hashes = hash_paths_parallel(
+            &paths,
+            aborted,
+            idx,
+            total,
+            &short_name,
+            "Verifying",
+            hash_total,
+            bytes_done,
+            overall_total_bytes,
+        );
+        bytes_done += hash_total;
 
-                for (j, hash_result) in hashes.into_iter().enumerate() {
-                    match hash_result {
-                        Ok(hash) => {
-                            if hash != *expected {
-                                print!("\r");
-                                eprintln!(
-                                    "[{}/{}] FAIL {} -> {} (hash mismatch: {} vs {})",
-                                    idx,
-                                    total,
-                                    file_name,
-                                    destinations[j].display(),
-                                    hash,
-                                    expected
-                                );
-                                all_ok = false;
-                            }
-                        }
-                        Err(e) => {
-                            if e.kind() == io::ErrorKind::Interrupted {
-                                return false;
-                            }
-                            print!("\r");
-                            eprintln!("[{}/{}] FAIL {} ({})", idx, total, file_name, e);
-                            all_ok = false;
-                        }
-                    }
-                }
-                bytes_done += hash_total;
-            }
-            VerifyMode::Source => {
-                let mut paths: Vec<PathBuf> = vec![result.source_path.clone()];
-                paths.extend(destinations.iter().map(|d| d.join(&result.relative_path)));
-                let hash_total = result.size * (1 + num_dests);
-
-                let hashes = hash_paths_parallel(
-                    &paths,
-                    aborted,
-                    idx,
-                    total,
-                    &short_name,
-                    "Verifying",
-                    hash_total,
-                    bytes_done,
-                    overall_total_bytes,
-                );
-
-                let source_hash = match &hashes[0] {
-                    Ok(h) => h.clone(),
-                    Err(e) => {
-                        if e.kind() == io::ErrorKind::Interrupted {
-                            return false;
-                        }
-                        print!("\r");
-                        eprintln!(
-                            "[{}/{}] FAIL {} (source read error: {})",
-                            idx, total, file_name, e
-                        );
-                        all_ok = false;
-                        bytes_done += hash_total;
-                        continue;
-                    }
-                };
-
-                if source_hash != *expected {
-                    print!("\r");
-                    eprintln!(
-                        "[{}/{}] FAIL {} (source changed: {} vs inflight {})",
-                        idx, total, file_name, source_hash, expected
-                    );
-                    all_ok = false;
-                }
-
-                for (j, hash_result) in hashes[1..].iter().enumerate() {
-                    match hash_result {
-                        Ok(hash) => {
-                            if *hash != source_hash {
-                                print!("\r");
-                                eprintln!(
-                                    "[{}/{}] FAIL {} -> {} (hash mismatch: {} vs source {})",
-                                    idx,
-                                    total,
-                                    file_name,
-                                    destinations[j].display(),
-                                    hash,
-                                    source_hash
-                                );
-                                all_ok = false;
-                            }
-                        }
-                        Err(e) => {
-                            if e.kind() == io::ErrorKind::Interrupted {
-                                return false;
-                            }
-                            print!("\r");
-                            eprintln!(
-                                "[{}/{}] FAIL {} (dest read error: {})",
-                                idx, total, file_name, e
-                            );
-                            all_ok = false;
-                        }
-                    }
-                }
-                bytes_done += hash_total;
-            }
-            VerifyMode::Transfer => unreachable!(),
+        if hashes
+            .iter()
+            .any(|h| matches!(h, Err(e) if e.kind() == io::ErrorKind::Interrupted))
+        {
+            return false;
         }
 
-        let elapsed = file_start.elapsed().as_secs_f64();
-        let file_hash_bytes = match mode {
-            VerifyMode::Source => result.size * (1 + num_dests),
-            VerifyMode::Target => result.size * num_dests,
-            VerifyMode::Transfer => unreachable!(),
+        // Reference hash: source hash in source mode, else in-flight hash,
+        // else (skipped file in target mode) the first readable target's hash —
+        // in that case a mismatch only proves the targets disagree, not which is bad.
+        let mut file_ok = true;
+        let mut ref_from_target: Option<usize> = None;
+        let reference = if with_source {
+            match hashes.remove(0) {
+                Ok(h) => {
+                    if !expected.is_empty() && h != expected {
+                        print!("\r");
+                        eprintln!(
+                            "[{}/{}] FAIL {} (source changed: {} vs inflight {})",
+                            idx, total, file_name, h, expected
+                        );
+                        file_ok = false;
+                    }
+                    Some(h)
+                }
+                Err(e) => {
+                    print!("\r");
+                    eprintln!("[{}/{}] FAIL {} (source read error: {})", idx, total, file_name, e);
+                    file_ok = false;
+                    None
+                }
+            }
+        } else if !expected.is_empty() {
+            Some(expected)
+        } else {
+            hashes.iter().position(|h| h.is_ok()).map(|p| {
+                ref_from_target = Some(p);
+                hashes[p].as_ref().unwrap().clone()
+            })
         };
+
+        for (j, hash_result) in hashes.iter().enumerate() {
+            match (hash_result, &reference) {
+                (Ok(hash), Some(r)) if hash != r => {
+                    print!("\r");
+                    if let Some(rj) = ref_from_target {
+                        eprintln!(
+                            "[{}/{}] FAIL {} (targets disagree: {} = {} vs {} = {})",
+                            idx,
+                            total,
+                            file_name,
+                            destinations[j].display(),
+                            hash,
+                            destinations[rj].display(),
+                            r
+                        );
+                    } else {
+                        eprintln!(
+                            "[{}/{}] FAIL {} -> {} (hash mismatch: {} vs {})",
+                            idx,
+                            total,
+                            file_name,
+                            destinations[j].display(),
+                            hash,
+                            r
+                        );
+                    }
+                    file_ok = false;
+                }
+                (Ok(_), _) => {}
+                (Err(e), _) => {
+                    print!("\r");
+                    eprintln!("[{}/{}] FAIL {} (dest read error: {})", idx, total, file_name, e);
+                    file_ok = false;
+                }
+            }
+        }
+
+        if let Some(r) = reference {
+            if results[ri].inflight_hash.is_empty() && file_ok {
+                results[ri].inflight_hash = r;
+            }
+        }
+        if !file_ok {
+            all_ok = false;
+            continue;
+        }
+        ok_count += 1;
+
+        let elapsed = file_start.elapsed().as_secs_f64();
         let speed = if elapsed > 0.0 {
-            file_hash_bytes as f64 / 1_048_576.0 / elapsed
+            hash_total as f64 / 1_048_576.0 / elapsed
         } else {
             0.0
         };
@@ -347,10 +371,7 @@ pub fn verify_all(
         0.0
     };
     println!(
-        "\nVerification complete: {}/{} OK, {:.1} MB/s avg",
-        if all_ok { total } else { 0 },
-        total,
-        avg_speed
+        "\nVerification complete: {ok_count}/{total} OK, {avg_speed:.1} MB/s avg"
     );
 
     all_ok
