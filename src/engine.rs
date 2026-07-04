@@ -9,9 +9,10 @@ use std::sync::{mpsc, Arc};
 use std::time::Instant;
 use xxhash_rust::xxh3::Xxh3;
 
-// Chunks in flight per destination; bounds memory (~128MB) and decouples mixed-speed
-// targets so a slow destination doesn't stall the reader or faster destinations.
-const QUEUE_DEPTH: usize = 16;
+// Chunks in flight per destination. Profiling showed depth 16 (128MB) makes
+// file-boundary stalls 4x longer (slow target drains its backlog while others idle,
+// then the fast target bursts); 8 balances transient absorption against that.
+const QUEUE_DEPTH: usize = 8;
 
 // Fills buf completely from f, looping past short reads until full or EOF; returns the
 // number of bytes read. This keeps every chunk exactly BUFFER_SIZE except the last,
