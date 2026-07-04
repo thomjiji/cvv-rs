@@ -87,7 +87,18 @@ pub struct DestWriter {
 }
 
 impl DestWriter {
+    // Preallocates to the final size so writes never extend the file: per-write EOF
+    // extension costs a synchronous metadata/journal commit under write-through,
+    // which profiling showed doubles disk busy-time and causes audible seeking.
     pub fn create(path: &Path, file_size: u64) -> io::Result<Self> {
+        let w = Self::open(path, file_size)?;
+        if file_size > 0 {
+            w.file.set_len(file_size)?;
+        }
+        Ok(w)
+    }
+
+    fn open(path: &Path, file_size: u64) -> io::Result<Self> {
         if file_size < DIRECT_WRITE_THRESHOLD || buffered_writes_forced() {
             let file = File::create(path)?;
             return Ok(Self { file, direct: false, tail: Vec::new(), aligned: None });
