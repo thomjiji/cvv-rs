@@ -73,3 +73,70 @@ impl Progress {
         self.overall.finish_and_clear();
     }
 }
+
+// One bar per device plus an overall bar, for the pipelined verify phase where each
+// device streams its whole file list independently. Bars show live per-device speed.
+pub struct DeviceProgress {
+    mp: MultiProgress,
+    devices: Vec<ProgressBar>,
+    overall: ProgressBar,
+}
+
+impl DeviceProgress {
+    pub fn new(devices: &[(String, u64)], overall_total: u64) -> Self {
+        let mp = MultiProgress::new();
+
+        let bars: Vec<ProgressBar> = devices
+            .iter()
+            .map(|(label, total)| {
+                let bar = mp.add(ProgressBar::new(*total));
+                bar.set_style(
+                    ProgressStyle::with_template(
+                        "{prefix:<12} {bar:30} {bytes}/{total_bytes} ({bytes_per_sec})",
+                    )
+                    .unwrap()
+                    .progress_chars("=> "),
+                );
+                bar.set_prefix(label.clone());
+                bar
+            })
+            .collect();
+
+        let overall = mp.add(ProgressBar::new(overall_total));
+        overall.set_style(
+            ProgressStyle::with_template(
+                "Overall {bar:30} {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})",
+            )
+            .unwrap()
+            .progress_chars("=> "),
+        );
+
+        Self { mp, devices: bars, overall }
+    }
+
+    pub fn set_device(&self, i: usize, bytes: u64) {
+        self.devices[i].set_position(bytes);
+    }
+
+    pub fn set_overall(&self, bytes: u64) {
+        self.overall.set_position(bytes);
+    }
+
+    // Same suspend+println! technique as Progress: MultiProgress::println drops output
+    // when the draw target is hidden, so route through suspend instead.
+    pub fn println(&self, msg: impl Display) {
+        let msg = msg.to_string();
+        self.mp.suspend(|| println!("{msg}"));
+    }
+
+    pub fn suspend<F: FnOnce() -> R, R>(&self, f: F) -> R {
+        self.mp.suspend(f)
+    }
+
+    pub fn finish(&self) {
+        for bar in &self.devices {
+            bar.finish_and_clear();
+        }
+        self.overall.finish_and_clear();
+    }
+}

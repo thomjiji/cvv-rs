@@ -1,3 +1,4 @@
+mod directio;
 mod engine;
 mod hashfile;
 mod progress;
