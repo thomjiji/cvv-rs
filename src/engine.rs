@@ -1,16 +1,33 @@
+use crate::directio::{DestWriter, BUFFER_SIZE};
 use crate::progress::Progress;
 use filetime::{set_file_times, FileTime};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 use xxhash_rust::xxh3::Xxh3;
 
-const BUFFER_SIZE: usize = 8 * 1024 * 1024;
-// Chunks in flight per destination; bounds memory and provides backpressure.
-const QUEUE_DEPTH: usize = 4;
+// Chunks in flight per destination; bounds memory (~128MB) and decouples mixed-speed
+// targets so a slow destination doesn't stall the reader or faster destinations.
+const QUEUE_DEPTH: usize = 16;
+
+// Fills buf completely from f, looping past short reads until full or EOF; returns the
+// number of bytes read. This keeps every chunk exactly BUFFER_SIZE except the last,
+// which is what makes O_DIRECT tail handling in DestWriter sound.
+fn read_full(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
 
 #[derive(Debug)]
 pub struct FileEntry {
@@ -140,14 +157,15 @@ fn copy_single_file(
     let mtime = FileTime::from_last_modification_time(&src_meta);
     let atime = FileTime::from_last_access_time(&src_meta);
 
-    let mut targets: Vec<(PathBuf, PathBuf, Option<File>)> = Vec::new();
+    let file_size = src_meta.len();
+    let mut targets: Vec<(PathBuf, PathBuf, Option<DestWriter>)> = Vec::new();
     for dest in dest_paths {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
         let tmp = tmp_path_for(dest);
-        let f = File::create(&tmp)?;
-        targets.push((dest.clone(), tmp, Some(f)));
+        let w = DestWriter::create(&tmp, file_size)?;
+        targets.push((dest.clone(), tmp, Some(w)));
     }
 
     // Reader thread streams chunks to one writer thread per destination through
@@ -155,15 +173,15 @@ fn copy_single_file(
     let copy_result = std::thread::scope(|s| {
         let mut senders = Vec::with_capacity(targets.len());
         let mut handles = Vec::with_capacity(targets.len());
-        for (_, _, f) in &mut targets {
-            let mut f = f.take().unwrap();
+        for (_, _, w) in &mut targets {
+            let mut w = w.take().unwrap();
             let (tx, rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(QUEUE_DEPTH);
             senders.push(tx);
             handles.push(s.spawn(move || -> io::Result<()> {
                 for chunk in rx {
-                    f.write_all(&chunk)?;
+                    w.write_chunk(&chunk)?;
                 }
-                f.sync_all()
+                w.finish()
             }));
         }
 
@@ -177,7 +195,7 @@ fn copy_single_file(
                 break;
             }
             let mut buf = vec![0u8; BUFFER_SIZE];
-            match src.read(&mut buf) {
+            match read_full(&mut src, &mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     buf.truncate(n);
