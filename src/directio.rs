@@ -76,14 +76,21 @@ fn buffered_writes_forced() -> bool {
 }
 
 // Destination file that bypasses the OS page cache for large files so lazy-writer
-// flushing doesn't cause throughput ripple. On Linux this is O_DIRECT (aligned writes
-// with an unaligned tail flushed buffered); on Windows FILE_FLAG_WRITE_THROUGH; on
-// macOS F_NOCACHE. Small/forced-buffered files fall back to a plain buffered File.
+// flushing doesn't cause throughput ripple. Windows uses FILE_FLAG_NO_BUFFERING and
+// Linux O_DIRECT (both: aligned writes, sub-4K tail flushed separately); macOS uses
+// F_NOCACHE. Deliberately NOT WRITE_THROUGH/O_DSYNC: per-write media commits doubled
+// disk busy-time over USB; durability comes from sync_all before the atomic rename.
+// Small/forced-buffered files fall back to a plain buffered File.
 pub struct DestWriter {
     file: File,
     direct: bool,
-    tail: Vec<u8>,        // linux O_DIRECT only: holds the sub-4K final tail
+    tail: Vec<u8>,        // direct only: holds the sub-4K final tail
     aligned: Option<AlignedBuffer>,
+    // Only the Windows tail path reads these; kept unconditionally to avoid cfg noise.
+    #[allow(dead_code)]
+    path: std::path::PathBuf,
+    #[allow(dead_code)]
+    written: u64,
 }
 
 impl DestWriter {
@@ -98,23 +105,50 @@ impl DestWriter {
         Ok(w)
     }
 
+    fn buffered(path: &Path) -> io::Result<Self> {
+        let file = File::create(path)?;
+        Ok(Self {
+            file,
+            direct: false,
+            tail: Vec::new(),
+            aligned: None,
+            path: path.to_path_buf(),
+            written: 0,
+        })
+    }
+
+    fn direct(file: File, path: &Path) -> Self {
+        Self {
+            file,
+            direct: true,
+            tail: Vec::new(),
+            aligned: Some(AlignedBuffer::new(BUFFER_SIZE)),
+            path: path.to_path_buf(),
+            written: 0,
+        }
+    }
+
     fn open(path: &Path, file_size: u64) -> io::Result<Self> {
         if file_size < DIRECT_WRITE_THRESHOLD || buffered_writes_forced() {
-            let file = File::create(path)?;
-            return Ok(Self { file, direct: false, tail: Vec::new(), aligned: None });
+            return Self::buffered(path);
         }
 
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            // FILE_FLAG_WRITE_THROUGH: no alignment requirement, plain write_all path.
-            let file = std::fs::OpenOptions::new()
+            // FILE_FLAG_NO_BUFFERING: bypasses the page cache without the per-write
+            // media commit WRITE_THROUGH forces, so the drive's own cache pipelines.
+            // Falls back to buffered if the filesystem rejects the flag.
+            return match std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .custom_flags(0x80000000)
-                .open(path)?;
-            return Ok(Self { file, direct: false, tail: Vec::new(), aligned: None });
+                .custom_flags(0x20000000)
+                .open(path)
+            {
+                Ok(file) => Ok(Self::direct(file, path)),
+                Err(_) => Self::buffered(path),
+            };
         }
 
         #[cfg(target_os = "macos")]
@@ -124,7 +158,14 @@ impl DestWriter {
             if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
                 return Err(io::Error::last_os_error());
             }
-            return Ok(Self { file, direct: false, tail: Vec::new(), aligned: None });
+            return Ok(Self {
+                file,
+                direct: false,
+                tail: Vec::new(),
+                aligned: None,
+                path: path.to_path_buf(),
+                written: 0,
+            });
         }
 
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -137,17 +178,9 @@ impl DestWriter {
                 .custom_flags(libc::O_DIRECT)
                 .open(path)
             {
-                Ok(file) => Ok(Self {
-                    file,
-                    direct: true,
-                    tail: Vec::new(),
-                    aligned: Some(AlignedBuffer::new(BUFFER_SIZE)),
-                }),
+                Ok(file) => Ok(Self::direct(file, path)),
                 // Some filesystems (tmpfs) reject O_DIRECT: fall back to buffered.
-                Err(_) => {
-                    let file = File::create(path)?;
-                    Ok(Self { file, direct: false, tail: Vec::new(), aligned: None })
-                }
+                Err(_) => Self::buffered(path),
             }
         }
     }
@@ -168,27 +201,50 @@ impl DestWriter {
         let aligned = self.aligned.as_mut().unwrap();
         aligned.as_mut_slice()[..full].copy_from_slice(&data[..full]);
         self.file.write_all(&aligned.as_mut_slice()[..full])?;
+        self.written += full as u64;
         self.tail.extend_from_slice(&data[full..]);
         Ok(())
     }
 
-    pub fn finish(mut self) -> io::Result<()> {
+    pub fn finish(self) -> io::Result<()> {
         if self.direct && !self.tail.is_empty() {
-            // Clear O_DIRECT so the sub-4K tail can be written without alignment.
-            #[cfg(all(unix, not(target_os = "macos")))]
-            {
-                use std::os::fd::AsRawFd;
-                let fd = self.file.as_raw_fd();
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                if flags == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_DIRECT) } == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            self.file.write_all(&self.tail)?;
+            return self.finish_tail();
         }
         self.file.sync_all()
+    }
+
+    // NO_BUFFERING handles can't write a sub-sector tail: close the unbuffered handle,
+    // then drop the tail in place through a plain one (file is already preallocated).
+    #[cfg(windows)]
+    fn finish_tail(self) -> io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let offset = self.written;
+        drop(self.file);
+        let mut f = std::fs::OpenOptions::new().write(true).open(&self.path)?;
+        f.seek(SeekFrom::Start(offset))?;
+        f.write_all(&self.tail)?;
+        f.sync_all()
+    }
+
+    // Clear O_DIRECT so the sub-4K tail can be written without alignment.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn finish_tail(mut self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let fd = self.file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_DIRECT) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        self.file.write_all(&self.tail)?;
+        self.file.sync_all()
+    }
+
+    // direct is never true on macOS (F_NOCACHE needs no alignment), so this can't run.
+    #[cfg(target_os = "macos")]
+    fn finish_tail(self) -> io::Result<()> {
+        unreachable!("no direct write mode on macOS")
     }
 }
